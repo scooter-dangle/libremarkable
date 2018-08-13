@@ -30,6 +30,7 @@ use framebuffer::FramebufferRefresh;
 use input::gpio::GPIOEvent;
 use input::multitouch::MultitouchEvent;
 use input::wacom::WacomEvent;
+use input::keyboard::KeyboardEvent;
 use input::{InputDevice, InputEvent};
 
 #[cfg(feature = "enable-runtime-benchmarking")]
@@ -58,6 +59,9 @@ pub struct ApplicationContext<'a> {
 
     touch_ctx: RwLock<Option<ev::EvDevContext>>,
     on_touch: fn(&mut ApplicationContext, MultitouchEvent),
+
+    keyboard_ctx: RwLock<Option<ev::EvDevContext>>,
+    on_keyboard: fn(&mut ApplicationContext, KeyboardEvent),
 
     active_regions: QuadTree<ActiveRegionHandler>,
     ui_elements: HashMap<String, UIElementHandle>,
@@ -91,16 +95,20 @@ impl<'a> ApplicationContext<'a> {
         on_button: fn(&mut ApplicationContext, GPIOEvent),
         on_wacom: fn(&mut ApplicationContext, WacomEvent),
         on_touch: fn(&mut ApplicationContext, MultitouchEvent),
+        on_keyboard: Option<fn(&mut ApplicationContext, KeyboardEvent)>,
     ) -> ApplicationContext<'static> {
         let framebuffer = box core::Framebuffer::new("/dev/fb0");
         let yres = framebuffer.var_screen_info.yres;
         let xres = framebuffer.var_screen_info.xres;
+
+        fn no_handler<EVENT>(_: &mut ApplicationContext, _: EVENT) {}
 
         let (input_tx, input_rx) = std::sync::mpsc::channel();
         let mut res = ApplicationContext {
             wacom_ctx: RwLock::new(None),
             button_ctx: RwLock::new(None),
             touch_ctx: RwLock::new(None),
+            keyboard_ctx: RwLock::new(None),
             framebuffer,
             xres,
             yres,
@@ -111,6 +119,7 @@ impl<'a> ApplicationContext<'a> {
             on_button,
             on_wacom,
             on_touch,
+            on_keyboard: on_keyboard.unwrap_or(no_handler),
             ui_elements: HashMap::new(),
             active_regions: QuadTree::default(geom::Rect::from_points(
                 &geom::Point { x: 0.0, y: 0.0 },
@@ -412,6 +421,7 @@ impl<'a> ApplicationContext<'a> {
         self.deactivate_input_device(InputDevice::Multitouch);
         self.deactivate_input_device(InputDevice::GPIO);
         self.deactivate_input_device(InputDevice::Wacom);
+        self.deactivate_input_device(InputDevice::Keyboard);
 
         // This will make us stop consuming and dispatching the InputEvents.
         self.running.store(false, Ordering::Relaxed);
@@ -437,7 +447,8 @@ impl<'a> ApplicationContext<'a> {
             InputDevice::Wacom => self.wacom_ctx.write().unwrap(),
             InputDevice::Multitouch => self.touch_ctx.write().unwrap(),
             InputDevice::GPIO => self.button_ctx.write().unwrap(),
-            _ => return false,
+            InputDevice::Keyboard => self.keyboard_ctx.write().unwrap(),
+            InputDevice::Unknown => unreachable!(),
         };
 
         let mut unwrapped = dev.take().unwrap();
@@ -457,18 +468,16 @@ impl<'a> ApplicationContext<'a> {
         // Now we know it isn't active, let's create and spawn
         // the producer thread
         let mut dev = match t {
-            InputDevice::Wacom => self.wacom_ctx.write().unwrap(),
-            InputDevice::Multitouch => self.touch_ctx.write().unwrap(),
-            InputDevice::GPIO => self.button_ctx.write().unwrap(),
-            _ => return false,
-        };
+            InputDevice::Wacom => &self.wacom_ctx,
+            InputDevice::Multitouch => &self.touch_ctx,
+            InputDevice::GPIO => &self.button_ctx,
+            InputDevice::Keyboard => &self.keyboard_ctx,
+            InputDevice::Unknown => unreachable!(),
+        }.write().unwrap();
 
         *dev = Some(ev::EvDevContext::new(t, self.input_tx.clone()));
         match dev.as_mut() {
-            Some(ref mut device) => {
-                device.start();
-                true
-            }
+            Some(ref mut device) => device.start(),
             None => false,
         }
     }
@@ -478,11 +487,12 @@ impl<'a> ApplicationContext<'a> {
     /// currently running `epoll` thread
     pub fn is_input_device_active(&self, t: InputDevice) -> bool {
         let ctx = match t {
-            InputDevice::Unknown => return false,
-            InputDevice::GPIO => self.button_ctx.read().unwrap(),
-            InputDevice::Multitouch => self.touch_ctx.read().unwrap(),
-            InputDevice::Wacom => self.wacom_ctx.read().unwrap(),
-        };
+            InputDevice::Unknown => unreachable!(),
+            InputDevice::GPIO => &self.button_ctx,
+            InputDevice::Multitouch => &self.touch_ctx,
+            InputDevice::Wacom => &self.wacom_ctx,
+            InputDevice::Keyboard => &self.keyboard_ctx,
+        }.read().unwrap();
         match *ctx {
             Some(ref c) => !c.exited() && !c.exit_requested(),
             None => false,
@@ -494,6 +504,7 @@ impl<'a> ApplicationContext<'a> {
         activate_wacom: bool,
         activate_multitouch: bool,
         activate_buttons: bool,
+        activate_keyboard: bool,
     ) {
         let appref = self.upgrade_ref();
 
@@ -505,6 +516,9 @@ impl<'a> ApplicationContext<'a> {
         }
         if activate_buttons {
             self.activate_input_device(InputDevice::GPIO);
+        }
+        if activate_keyboard {
+            self.activate_input_device(InputDevice::Keyboard);
         }
 
         // Now we consume the input events
@@ -537,7 +551,10 @@ impl<'a> ApplicationContext<'a> {
                     InputEvent::WacomEvent { event } => {
                         (self.on_wacom)(appref, event);
                     }
-                    _ => {}
+                    InputEvent::Keyboard { event } => {
+                        (self.on_keyboard)(appref, event);
+                    }
+                    InputEvent::Unknown {} => unreachable!(),
                 },
             };
         }

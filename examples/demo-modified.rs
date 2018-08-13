@@ -13,7 +13,13 @@ use libremarkable::framebuffer::refresh::PartialRefreshMode;
 use libremarkable::framebuffer::storage;
 use libremarkable::framebuffer::{FramebufferDraw, FramebufferIO, FramebufferRefresh};
 use libremarkable::image::GenericImage;
-use libremarkable::input::{gpio, multitouch, wacom, InputDevice};
+use libremarkable::input::{
+    gpio::{GPIOEvent, PhysicalButton},
+    multitouch,
+    wacom::{WacomEvent, WacomPen},
+    keyboard::KeyboardEvent,
+    InputDevice,
+};
 use libremarkable::ui_extensions::element::{
     UIConstraintRefresh, UIElement, UIElementHandle, UIElementWrapper,
 };
@@ -28,11 +34,53 @@ use chrono::{DateTime, Local};
 extern crate atomic;
 use atomic::Atomic;
 
+use std::mem::swap;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::Duration;
+
+use std::error::Error;
+use std::fs;
+use std::path;
+
+fn display_path(test_path: path::PathBuf) -> Result<String, Box<Error>> {
+    let canonical = test_path.canonicalize()?;
+    Ok(if test_path == canonical {
+        test_path.to_string_lossy().into_owned()
+    } else {
+        format!(
+            "{}\u{2192}{}",
+            test_path.to_string_lossy(),
+            canonical.to_string_lossy(),
+        )
+    })
+}
+
+fn list_paths(test_path: path::PathBuf) -> Result<Vec<String>, Box<Error>> {
+    fn _list_paths(test_path: path::PathBuf) -> Result<Vec<String>, Box<Error>> {
+        let out = if test_path.is_dir() {
+            fs::read_dir(test_path)?
+                .into_iter()
+                .flat_map(|path| {
+                    // Panicking probably doesn't matter here since we don't know how to handle a case
+                    // where we are unable to access the supplied paths.
+                    _list_paths(path.unwrap().path()).unwrap()
+                })
+                .collect()
+        } else {
+            vec![display_path(test_path)?]
+        };
+
+        Ok(out)
+    }
+
+    _list_paths(test_path).map(|mut paths| {
+        paths.sort_unstable();
+        paths
+    })
+}
 
 #[derive(Copy, Clone, PartialEq)]
 enum DrawMode {
@@ -54,8 +102,7 @@ impl DrawMode {
     }
     fn get_size(self) -> usize {
         match self {
-            DrawMode::Draw(s) => s,
-            DrawMode::Erase(s) => s,
+            DrawMode::Draw(s) | DrawMode::Erase(s) => s,
         }
     }
 }
@@ -114,8 +161,7 @@ fn on_save_canvas(app: &mut appctx::ApplicationContext, _element: UIElementHandl
     match framebuffer.dump_region(CANVAS_REGION) {
         Err(err) => println!("Failed to dump buffer: {0}", err),
         Ok(buff) => {
-            let mut hist = SAVED_CANVAS.lock().unwrap();
-            *hist = Some(storage::CompressedCanvasState::new(
+            *SAVED_CANVAS.lock().unwrap() = Some(storage::CompressedCanvasState::new(
                 buff.as_slice(),
                 CANVAS_REGION.height,
                 CANVAS_REGION.width,
@@ -236,28 +282,25 @@ fn on_invert_canvas(app: &mut appctx::ApplicationContext, element: UIElementHand
 
 fn on_load_canvas(app: &mut appctx::ApplicationContext, _element: UIElementHandle) {
     start_bench!(stopwatch, load_canvas);
-    match *SAVED_CANVAS.lock().unwrap() {
-        None => {}
-        Some(ref compressed_state) => {
-            let framebuffer = app.get_framebuffer_ref();
-            let decompressed = compressed_state.decompress();
+    if let Some(ref compressed_state) = *SAVED_CANVAS.lock().unwrap() {
+        let framebuffer = app.get_framebuffer_ref();
+        let decompressed = compressed_state.decompress();
 
-            match framebuffer.restore_region(CANVAS_REGION, &decompressed) {
-                Err(e) => println!("Error while restoring region: {0}", e),
-                Ok(_) => {
-                    framebuffer.partial_refresh(
-                        &CANVAS_REGION,
-                        PartialRefreshMode::Async,
-                        waveform_mode::WAVEFORM_MODE_GC16_FAST,
-                        display_temp::TEMP_USE_REMARKABLE_DRAW,
-                        dither_mode::EPDC_FLAG_USE_DITHERING_PASSTHROUGH,
-                        0,
-                        false,
-                    );
-                }
-            };
-        }
-    };
+        match framebuffer.restore_region(CANVAS_REGION, &decompressed) {
+            Err(e) => println!("Error while restoring region: {0}", e),
+            Ok(_) => {
+                framebuffer.partial_refresh(
+                    &CANVAS_REGION,
+                    PartialRefreshMode::Async,
+                    waveform_mode::WAVEFORM_MODE_GC16_FAST,
+                    display_temp::TEMP_USE_REMARKABLE_DRAW,
+                    dither_mode::EPDC_FLAG_USE_DITHERING_PASSTHROUGH,
+                    0,
+                    false,
+                );
+            }
+        };
+    }
     end_bench!(load_canvas);
 }
 
@@ -363,17 +406,9 @@ fn change_brush_width(app: &mut appctx::ApplicationContext, delta: isize) {
     app.draw_element("displaySize");
 }
 
-fn loop_update_topbar(app: &mut appctx::ApplicationContext, millis: u64) {
-    let time_label = app.get_element_by_name("time").unwrap();
+fn loop_update_battery(app: &mut appctx::ApplicationContext, millis: u64) {
     let battery_label = app.get_element_by_name("battery").unwrap();
     loop {
-        // Get the datetime
-        let dt: DateTime<Local> = Local::now();
-
-        if let UIElement::Text { ref mut text, .. } = time_label.write().inner {
-            *text = format!("{}", dt.format("%F %r"));
-        }
-
         if let UIElement::Text { ref mut text, .. } = battery_label.write().inner {
             *text = format!(
                 "{0:<128}",
@@ -384,8 +419,22 @@ fn loop_update_topbar(app: &mut appctx::ApplicationContext, millis: u64) {
                 )
             );
         }
-        app.draw_element("time");
-        app.draw_element("battery");
+        battery_label.write().draw(app, &None);
+        sleep(Duration::from_millis(millis));
+    }
+}
+
+fn loop_update_datetime(app: &mut appctx::ApplicationContext, millis: u64) {
+    let time_label = app.get_element_by_name("time").unwrap();
+    loop {
+        // Get the datetime
+        let dt: DateTime<Local> = Local::now();
+
+        if let UIElement::Text { ref mut text, .. } = time_label.write().inner {
+            *text = format!("{}", dt.format("%F %r"));
+        }
+
+        time_label.write().draw(app, &None);
         sleep(Duration::from_millis(millis));
     }
 }
@@ -394,15 +443,9 @@ fn loop_update_topbar(app: &mut appctx::ApplicationContext, millis: u64) {
 // ## Input Handlers
 // ####################
 
-fn on_wacom_input(app: &mut appctx::ApplicationContext, input: wacom::WacomEvent) {
+fn on_wacom_input(app: &mut appctx::ApplicationContext, input: WacomEvent) {
     match input {
-        wacom::WacomEvent::Draw {
-            y,
-            x,
-            pressure,
-            tilt_x: _,
-            tilt_y: _,
-        } => {
+        WacomEvent::Draw { y, x, pressure, .. } => {
             let mut wacom_stack = WACOM_HISTORY.lock().unwrap();
 
             // This is so that we can click the buttons outside the canvas region
@@ -454,36 +497,30 @@ fn on_wacom_input(app: &mut appctx::ApplicationContext, input: wacom::WacomEvent
             }
             wacom_stack.push((y as i32, x as i32));
         }
-        wacom::WacomEvent::InstrumentChange { pen, state } => {
-            match pen {
-                // Whether the pen is in range
-                wacom::WacomPen::ToolPen => {
-                    WACOM_IN_RANGE.store(state, Ordering::Relaxed);
-                }
-                // Whether the pen is actually making contact
-                wacom::WacomPen::Touch => {
-                    // Stop drawing when instrument has left the vicinity of the screen
-                    if !state {
-                        let mut wacom_stack = WACOM_HISTORY.lock().unwrap();
-                        wacom_stack.clear();
-                    }
-                }
-                _ => unreachable!(),
-            }
-        }
-        wacom::WacomEvent::Hover {
-            y: _,
-            x: _,
-            distance,
-            tilt_x: _,
-            tilt_y: _,
-        } => {
+
+        // Whether the pen is in range
+        WacomEvent::InstrumentChange {
+            pen: WacomPen::ToolPen,
+            state,
+        } => WACOM_IN_RANGE.store(state, Ordering::Relaxed),
+
+        WacomEvent::InstrumentChange {
+            pen: WacomPen::Touch,
+            state: true,
+        } => {}
+        // Whether the pen is actually making contact
+        // Stop drawing when instrument has left the vicinity of the screen
+        WacomEvent::InstrumentChange {
+            pen: WacomPen::Touch,
+            state: false,
+        } => WACOM_HISTORY.lock().unwrap().clear(),
+
+        WacomEvent::InstrumentChange { pen: _, .. } => unreachable!(),
+
+        WacomEvent::Hover { distance, .. } if distance > 1 => {
             // If the pen is hovering, don't record its coordinates as the origin of the next line
-            if distance > 1 {
-                let mut wacom_stack = WACOM_HISTORY.lock().unwrap();
-                wacom_stack.clear();
-                UNPRESS_OBSERVED.store(true, Ordering::Relaxed);
-            }
+            WACOM_HISTORY.lock().unwrap().clear();
+            UNPRESS_OBSERVED.store(true, Ordering::Relaxed);
         }
         _ => {}
     };
@@ -491,54 +528,60 @@ fn on_wacom_input(app: &mut appctx::ApplicationContext, input: wacom::WacomEvent
 
 fn on_touch_handler(app: &mut appctx::ApplicationContext, input: multitouch::MultitouchEvent) {
     let framebuffer = app.get_framebuffer_ref();
-    match input {
-        multitouch::MultitouchEvent::Touch {
-            gesture_seq: _,
-            finger_id: _,
-            y,
-            x,
-        } => {
-            if !CANVAS_REGION.contains_point(y.into(), x.into()) {
-                return;
-            }
-            let rect = match G_TOUCH_MODE.load(Ordering::Relaxed) {
-                TouchMode::Bezier => framebuffer.draw_bezier(
-                    (x as f32, y as f32),
-                    ((x + 155) as f32, (y + 14) as f32),
-                    ((x + 200) as f32, (y + 200) as f32),
-                    2,
-                    color::BLACK,
-                ),
-                TouchMode::Circles => {
-                    framebuffer.draw_circle(y as usize, x as usize, 20, color::BLACK)
-                }
-                _ => return,
-            };
-            framebuffer.partial_refresh(
-                &rect,
-                PartialRefreshMode::Async,
-                waveform_mode::WAVEFORM_MODE_DU,
-                display_temp::TEMP_USE_REMARKABLE_DRAW,
-                dither_mode::EPDC_FLAG_USE_DITHERING_ALPHA,
-                DRAWING_QUANT_BIT,
-                false,
-            );
+    if let multitouch::MultitouchEvent::Touch { y, x, .. } = input {
+        if !CANVAS_REGION.contains_point(y.into(), x.into()) {
+            return;
         }
-        _ => {}
+        let rect = match G_TOUCH_MODE.load(Ordering::Relaxed) {
+            TouchMode::Bezier => framebuffer.draw_bezier(
+                (x as f32, y as f32),
+                ((x + 155) as f32, (y + 14) as f32),
+                ((x + 200) as f32, (y + 200) as f32),
+                2,
+                color::BLACK,
+            ),
+            TouchMode::Circles => framebuffer.draw_circle(y as usize, x as usize, 20, color::BLACK),
+            _ => return,
+        };
+        framebuffer.partial_refresh(
+            &rect,
+            PartialRefreshMode::Async,
+            waveform_mode::WAVEFORM_MODE_DU,
+            display_temp::TEMP_USE_REMARKABLE_DRAW,
+            dither_mode::EPDC_FLAG_USE_DITHERING_ALPHA,
+            DRAWING_QUANT_BIT,
+            false,
+        );
     }
 }
 
-fn on_button_press(app: &mut appctx::ApplicationContext, input: gpio::GPIOEvent) {
-    let (btn, new_state) = match input {
-        gpio::GPIOEvent::Press { button } => (button, true),
-        gpio::GPIOEvent::Unpress { button } => (button, false),
+fn on_keyboard_input(app: &mut appctx::ApplicationContext, input: KeyboardEvent) {
+    if let KeyboardEvent::Char(chr) = input {
+        app.display_text(
+            1320,
+            900,
+            color::BLACK,
+            48,
+            1,
+            2,
+            chr.to_string(),
+            UIConstraintRefresh::Refresh,
+        );
+    };
+    println!("{:?}", input)
+    // let keyboard_label = app.get_element_by_name(KEYBOARD_OUTPUT_NAME).unwrap();
+    // if let UIElement::Text { ref mut text, .. } = keyboard_label.write().inner {
+    //     *text = format!("{:#?}", input);
+    // }
+    // keyboard_label.write().draw(app, &None);
+}
+
+fn on_button_press(app: &mut appctx::ApplicationContext, input: GPIOEvent) {
+    let btn = match input {
+        GPIOEvent::Press { button } => button,
+        // Ignoring the unpressed event
         _ => return,
     };
-
-    // Ignoring the unpressed event
-    if !new_state {
-        return;
-    }
 
     // Simple but effective accidental button press filtering
     if WACOM_IN_RANGE.load(Ordering::Relaxed) {
@@ -546,40 +589,27 @@ fn on_button_press(app: &mut appctx::ApplicationContext, input: gpio::GPIOEvent)
     }
 
     match btn {
-        gpio::PhysicalButton::RIGHT => {
-            let new_state = match app.is_input_device_active(InputDevice::Multitouch) {
-                true => {
-                    app.deactivate_input_device(InputDevice::Multitouch);
-                    "Enable Touch"
-                }
-                false => {
-                    app.activate_input_device(InputDevice::Multitouch);
-                    "Disable Touch"
-                }
+        PhysicalButton::RIGHT => {
+            let new_state = if app.is_input_device_active(InputDevice::Multitouch) {
+                app.deactivate_input_device(InputDevice::Multitouch);
+                "Enable Touch"
+            } else {
+                app.activate_input_device(InputDevice::Multitouch);
+                "Disable Touch"
             };
 
-            match app.get_element_by_name("tooltipRight") {
-                Some(ref elem) => {
-                    if let UIElement::Text {
-                        ref mut text,
-                        scale: _,
-                        foreground: _,
-                        border_px: _,
-                    } = elem.write().inner
-                    {
-                        *text = new_state.to_string();
-                    }
+            app.get_element_by_name("tooltipRight").map(|ref elem| {
+                if let UIElement::Text { ref mut text, .. } = elem.write().inner {
+                    *text = new_state.to_string();
                 }
-                None => {}
-            }
+            });
             app.draw_element("tooltipRight");
-            return;
         }
-        gpio::PhysicalButton::MIDDLE | gpio::PhysicalButton::LEFT => {
-            app.clear(btn == gpio::PhysicalButton::MIDDLE);
+        PhysicalButton::MIDDLE | PhysicalButton::LEFT => {
+            app.clear(btn == PhysicalButton::MIDDLE);
             app.draw_elements();
         }
-        gpio::PhysicalButton::POWER => {
+        PhysicalButton::POWER => {
             Command::new("systemctl")
                 .arg("start")
                 .arg("xochitl")
@@ -587,11 +617,57 @@ fn on_button_press(app: &mut appctx::ApplicationContext, input: gpio::GPIOEvent)
                 .unwrap();
             std::process::exit(0);
         }
-        gpio::PhysicalButton::WAKEUP => {
+        PhysicalButton::WAKEUP => {
             println!("WAKEUP button(?) pressed(?)");
         }
-    };
+    }
 }
+
+fn loop_reload_inputs(app: &mut appctx::ApplicationContext, millis: u64) {
+    let input_devices_region = app.get_element_by_name(INPUT_DEVICES_NAME).unwrap();
+    let mut inputs = vec![];
+    loop {
+        let mut new_inputs = list_paths("/dev/input".into()).unwrap();
+        if inputs != new_inputs {
+            swap(&mut inputs, &mut new_inputs);
+            reload_inputs(app, input_devices_region.clone());
+        }
+        sleep(Duration::from_millis(millis));
+    }
+}
+
+fn reload_inputs(app: &mut appctx::ApplicationContext, ui_el: UIElementHandle) {
+    // ui_el.write().draw(app, &None)
+    let UIElementWrapper { x, y, .. } = *ui_el.read();
+    const SCALE: usize = 32;
+    // app.clear(false);
+    app.flash_element(INPUT_DEVICES_NAME);
+    list_paths("/dev/input".into())
+        .unwrap()
+        .into_iter()
+        .enumerate()
+        .for_each(|(idx, dev)| {
+            let y = y + SCALE + (idx * 30);
+            let x = x + 30;
+            let mut addition = 0;
+            dev.chars().for_each(|chr| {
+                addition +=
+                    app.display_text(
+                        y,
+                        x + addition,
+                        color::BLACK,
+                        SCALE,
+                        1,
+                        2,
+                        chr.to_string(),
+                        UIConstraintRefresh::Refresh,
+                    ).width as usize;
+            });
+        });
+}
+
+const INPUT_DEVICES_NAME: &'static str = "inputDevices";
+const KEYBOARD_OUTPUT_NAME: &'static str = "keyboardOut";
 
 fn main() {
     env_logger::init();
@@ -599,7 +675,7 @@ fn main() {
     // Takes callback functions as arguments
     // They are called with the event and the &mut framebuffer
     let mut app: appctx::ApplicationContext =
-        appctx::ApplicationContext::new(on_button_press, on_wacom_input, on_touch_handler, None);
+        appctx::ApplicationContext::new(on_button_press, on_wacom_input, on_touch_handler, Some(on_keyboard_input));
 
     // Alternatively we could have called `app.execute_lua("fb.clear()")`
     app.clear(true);
@@ -610,7 +686,6 @@ fn main() {
         UIElementWrapper {
             y: 10,
             x: 900,
-            refresh: UIConstraintRefresh::Refresh,
 
             /* We could have alternatively done this:
 
@@ -632,7 +707,6 @@ fn main() {
             y: (CANVAS_REGION.top - 2) as usize,
             x: CANVAS_REGION.left as usize,
             refresh: UIConstraintRefresh::RefreshAndWait,
-            onclick: None,
             inner: UIElement::Region {
                 height: (CANVAS_REGION.height + 3) as usize,
                 width: (CANVAS_REGION.width + 1) as usize,
@@ -648,12 +722,11 @@ fn main() {
         UIElementWrapper {
             y: 300,
             x: 960,
-            refresh: UIConstraintRefresh::Refresh,
 
             onclick: Some(draw_color_test_rgb),
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "Show RGB Test Image".to_owned(),
+                text: "Show RGB Test Image".into(),
                 scale: 35,
                 border_px: 3,
             },
@@ -667,30 +740,29 @@ fn main() {
         UIElementWrapper {
             y: 370,
             x: 960,
-            refresh: UIConstraintRefresh::Refresh,
 
             onclick: Some(on_zoom_out),
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "Zoom Out".to_owned(),
+                text: "Zoom Out".into(),
                 scale: 45,
                 border_px: 5,
             },
             ..Default::default()
         },
     );
+
     // Blur Toggle
     app.add_element(
         "blurToggle",
         UIElementWrapper {
             y: 370,
             x: 1155,
-            refresh: UIConstraintRefresh::Refresh,
 
             onclick: Some(on_blur_canvas),
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "Blur".to_owned(),
+                text: "Blur".into(),
                 scale: 45,
                 border_px: 5,
             },
@@ -703,12 +775,11 @@ fn main() {
         UIElementWrapper {
             y: 370,
             x: 1247,
-            refresh: UIConstraintRefresh::Refresh,
 
             onclick: Some(on_invert_canvas),
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "Invert".to_owned(),
+                text: "Invert".into(),
                 scale: 45,
                 border_px: 5,
             },
@@ -722,12 +793,11 @@ fn main() {
         UIElementWrapper {
             y: 440,
             x: 960,
-            refresh: UIConstraintRefresh::Refresh,
 
             onclick: Some(on_save_canvas),
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "Save".to_owned(),
+                text: "Save".into(),
                 scale: 45,
                 border_px: 5,
             },
@@ -740,12 +810,11 @@ fn main() {
         UIElementWrapper {
             y: 440,
             x: 1080,
-            refresh: UIConstraintRefresh::Refresh,
 
             onclick: Some(on_load_canvas),
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "Load".to_owned(),
+                text: "Load".into(),
                 scale: 45,
                 border_px: 5,
             },
@@ -759,12 +828,11 @@ fn main() {
         UIElementWrapper {
             y: 510,
             x: 960,
-            refresh: UIConstraintRefresh::Refresh,
 
             onclick: Some(on_change_touchdraw_mode),
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "Touch Mode".to_owned(),
+                text: "Touch Mode".into(),
                 scale: 45,
                 border_px: 5,
             },
@@ -776,12 +844,10 @@ fn main() {
         UIElementWrapper {
             y: 510,
             x: 1210,
-            refresh: UIConstraintRefresh::Refresh,
 
-            onclick: None,
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "None".to_owned(),
+                text: "None".into(),
                 scale: 40,
                 border_px: 0,
             },
@@ -795,12 +861,11 @@ fn main() {
         UIElementWrapper {
             y: 580,
             x: 960,
-            refresh: UIConstraintRefresh::Refresh,
 
             onclick: Some(on_toggle_eraser),
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "Draw Color".to_owned(),
+                text: "Draw Color".into(),
                 scale: 45,
                 border_px: 5,
             },
@@ -812,9 +877,7 @@ fn main() {
         UIElementWrapper {
             y: 580,
             x: 1210,
-            refresh: UIConstraintRefresh::Refresh,
 
-            onclick: None,
             inner: UIElement::Text {
                 foreground: color::BLACK,
                 text: G_DRAW_MODE.load(Ordering::Relaxed).color_as_string(),
@@ -831,13 +894,10 @@ fn main() {
         UIElementWrapper {
             y: 670,
             x: 960,
-            refresh: UIConstraintRefresh::Refresh,
-            onclick: Some(|appctx, _| {
-                change_brush_width(appctx, -1);
-            }),
+            onclick: Some(|appctx, _| change_brush_width(appctx, -1)),
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "-".to_owned(),
+                text: "-".into(),
                 scale: 90,
                 border_px: 5,
             },
@@ -849,7 +909,6 @@ fn main() {
         UIElementWrapper {
             y: 670,
             x: 1030,
-            refresh: UIConstraintRefresh::Refresh,
             inner: UIElement::Text {
                 foreground: color::BLACK,
                 text: format!("size: {0}", G_DRAW_MODE.load(Ordering::Relaxed).get_size()),
@@ -864,13 +923,10 @@ fn main() {
         UIElementWrapper {
             y: 670,
             x: 1210,
-            refresh: UIConstraintRefresh::Refresh,
-            onclick: Some(|appctx, _| {
-                change_brush_width(appctx, 1);
-            }),
+            onclick: Some(|appctx, _| change_brush_width(appctx, 1)),
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "+".to_owned(),
+                text: "+".into(),
                 scale: 90,
                 border_px: 5,
             },
@@ -883,12 +939,11 @@ fn main() {
         UIElementWrapper {
             y: 50,
             x: 30,
-            refresh: UIConstraintRefresh::Refresh,
 
             onclick: None,
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "Press POWER to return to reMarkable".to_owned(),
+                text: "Press POWER to return to reMarkable".into(),
                 scale: 35,
                 border_px: 0,
             },
@@ -900,10 +955,9 @@ fn main() {
         UIElementWrapper {
             y: 620,
             x: 30,
-            refresh: UIConstraintRefresh::Refresh,
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "Available at:".to_owned(),
+                text: "Available at:".into(),
                 scale: 70,
                 border_px: 0,
             },
@@ -915,25 +969,71 @@ fn main() {
         UIElementWrapper {
             y: 690,
             x: 30,
-            refresh: UIConstraintRefresh::Refresh,
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "github.com/canselcik/libremarkable".to_owned(),
+                text: "github.com/canselcik/libremarkable".into(),
                 scale: 55,
                 border_px: 0,
             },
             ..Default::default()
         },
     );
+
+    app.add_element(
+        KEYBOARD_OUTPUT_NAME,
+        UIElementWrapper {
+            y: 1400,
+            x: 30,
+            inner: UIElement::Text {
+                foreground: color::BLACK,
+                text: "".into(),
+                scale: 36,
+                border_px: 3,
+            },
+            ..Default::default()
+        },
+    );
+
+    {
+        let (y, x) = (760, 30);
+
+        let input_devices_region =
+            app.add_element(
+                INPUT_DEVICES_NAME,
+                UIElementWrapper {
+                    y: y as usize,
+                    x: x as usize,
+                    inner: UIElement::Region {
+                        height: 460,
+                        width: 1240,
+                        border_color: color::GRAY(32),
+                        border_px: 3,
+                    },
+                    ..Default::default()
+                },
+            ).unwrap();
+
+        app.create_active_region(
+            y as u16,
+            x as u16,
+            460,
+            1240,
+            reload_inputs,
+            input_devices_region,
+        );
+    }
+
+    {
+    }
+
     app.add_element(
         "l1",
         UIElementWrapper {
             y: 350,
             x: 30,
-            refresh: UIConstraintRefresh::Refresh,
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "Low Latency eInk Display Partial Refresh API".to_owned(),
+                text: "Low Latency eInk Display Partial Refresh API".into(),
                 scale: 45,
                 border_px: 0,
             },
@@ -945,10 +1045,9 @@ fn main() {
         UIElementWrapper {
             y: 400,
             x: 30,
-            refresh: UIConstraintRefresh::Refresh,
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "Capacitive Multitouch Input Support".to_owned(),
+                text: "Capacitive Multitouch Input Support".into(),
                 scale: 45,
                 border_px: 0,
             },
@@ -960,10 +1059,9 @@ fn main() {
         UIElementWrapper {
             y: 450,
             x: 30,
-            refresh: UIConstraintRefresh::Refresh,
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "Physical Button Support".to_owned(),
+                text: "Physical Button Support".into(),
                 scale: 45,
                 border_px: 0,
             },
@@ -975,10 +1073,9 @@ fn main() {
         UIElementWrapper {
             y: 500,
             x: 30,
-            refresh: UIConstraintRefresh::Refresh,
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "Wacom Digitizer Support".to_owned(),
+                text: "Wacom Digitizer Support".into(),
                 scale: 45,
                 border_px: 0,
             },
@@ -991,11 +1088,9 @@ fn main() {
         UIElementWrapper {
             y: 1850,
             x: 15,
-            refresh: UIConstraintRefresh::Refresh,
-            onclick: None,
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "Quick Redraw".to_owned(), // maybe quick redraw for the demo or waveform change?
+                text: "Quick Redraw".into(), // maybe quick redraw for the demo or waveform change?
                 scale: 50,
                 border_px: 0,
             },
@@ -1007,10 +1102,9 @@ fn main() {
         UIElementWrapper {
             y: 1850,
             x: 565,
-            refresh: UIConstraintRefresh::Refresh,
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "Full Redraw".to_owned(),
+                text: "Full Redraw".into(),
                 scale: 50,
                 border_px: 0,
             },
@@ -1022,10 +1116,9 @@ fn main() {
         UIElementWrapper {
             y: 1850,
             x: 1112,
-            refresh: UIConstraintRefresh::Refresh,
             inner: UIElement::Text {
                 foreground: color::BLACK,
-                text: "Disable Touch".to_owned(),
+                text: "Disable Touch".into(),
                 scale: 50,
                 border_px: 0,
             },
@@ -1040,7 +1133,6 @@ fn main() {
         UIElementWrapper {
             y: 215,
             x: 30,
-            refresh: UIConstraintRefresh::Refresh,
             inner: UIElement::Text {
                 foreground: color::BLACK,
                 text: format!(
@@ -1062,7 +1154,6 @@ fn main() {
         UIElementWrapper {
             y: 150,
             x: 30,
-            refresh: UIConstraintRefresh::Refresh,
             inner: UIElement::Text {
                 foreground: color::BLACK,
                 text: format!("{}", dt.format("%F %r")),
@@ -1076,40 +1167,65 @@ fn main() {
     // Draw the scene
     app.draw_elements();
 
-    // Get a &mut to the framebuffer object, exposing many convenience functions
-    let appref = app.upgrade_ref();
-    let clock_thread = std::thread::spawn(move || {
-        loop_update_topbar(appref, 30 * 1000);
-    });
+    macro_rules! spawn {
+        (let $name:ident = thread(|$app:ident -> $appref:ident| $thing:expr);) => {
+            let $name = {
+                let $appref = $app.upgrade_ref();
+                std::thread::Builder::new()
+                    .name(stringify!($name).to_string())
+                    .spawn(move || $thing)
+                    .unwrap()
+            };
+        };
+    }
+
+    spawn! {
+        let clock_thread = thread(|app -> appref| loop_update_datetime(appref, 1 * 1000));
+    }
+
+    spawn! {
+        let battery_thread = thread(|app -> appref| loop_update_battery(appref, 30 * 1000));
+    }
+
+    spawn! {
+        let attach_keyboard_thread = thread(|app -> appref| loop {
+            appref.activate_input_device(InputDevice::Keyboard);
+            sleep(Duration::from_millis(2 * 1_000));
+        });
+    }
+
+    spawn! {
+        let input_devices_thread = thread(|app -> appref| loop_reload_inputs(appref, 2 * 1000));
+    }
 
     app.execute_lua(
         r#"
-      function draw_box(y, x, height, width, borderpx, bordercolor)
-        local maxy = y+height;
-        local maxx = x+width;
-        for cy=y,maxy,1 do
-          for cx=x,maxx,1 do
-            if (math.abs(cx-x) < borderpx or math.abs(maxx-cx) < borderpx) or
-               (math.abs(cy-y) < borderpx or math.abs(maxy-cy) < borderpx) then
-              fb.set_pixel(cy, cx, bordercolor);
+          local draw_box = function(y, x, height, width, borderpx, bordercolor)
+            local maxy = y + height
+            local maxx = x + width
+            for cy = y,maxy,1 do
+              for cx = x,maxx,1 do
+                if (math.abs(cx-x) < borderpx or math.abs(maxx-cx) < borderpx) or
+                   (math.abs(cy-y) < borderpx or math.abs(maxy-cy) < borderpx) then
+                  fb.set_pixel(cy, cx, bordercolor)
+                end
+              end
             end
           end
-        end
-      end
 
-      top = 430;
-      left = 570;
-      width = 320;
-      height = 90;
-      borderpx = 3;
-      draw_box(top, left, height, width, borderpx, 255);
+          local top = 430
+          local left = 570
+          width = 320
+          height = 90
+          borderpx = 3
+          draw_box(top, left, height, width, borderpx, 255)
 
-      -- Draw black text inside the box. Notice the text is bottom aligned.
-      fb.draw_text(top+55, left+22, '...also supports Lua', 30, 255);
+          -- Draw black text inside the box. Notice the text is bottom aligned.
+          fb.draw_text(top + 55, left + 22, '...also supports Lua', 30, 255)
 
-      -- Update the drawn rect w/ `deep_plot=false` and `wait_for_update_complete=true`
-      fb.refresh(top, left, height, width, false, true);
-    "#,
+          -- Update the drawn rect w/ `deep_plot=false` and `wait_for_update_complete=true`
+          fb.refresh(top, left, height, width, false, true)
+        "#,
     );
 
     info!("Init complete. Beginning event dispatch...");
@@ -1117,4 +1233,7 @@ fn main() {
     // Blocking call to process events from digitizer + touchscreen + physical buttons
     app.dispatch_events(true, true, true, false);
     clock_thread.join().unwrap();
+    battery_thread.join().unwrap();
+    attach_keyboard_thread.join().unwrap();
+    input_devices_thread.join().unwrap();
 }

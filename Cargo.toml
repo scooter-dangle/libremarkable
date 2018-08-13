@@ -48,6 +48,11 @@ path = "examples/demo.rs"
 crate-type = ["bin"]
 
 [[example]]
+name = "demo-modified"
+path = "examples/demo-modified.rs"
+crate-type = ["bin"]
+
+[[example]]
 name = "live"
 path = "examples/live.rs"
 crate-type = ["bin"]

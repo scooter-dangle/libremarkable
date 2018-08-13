@@ -11,22 +11,27 @@ pub mod gpio;
 /// Contains the code to decode multitouch events
 pub mod multitouch;
 
-#[derive(PartialEq, Copy, Clone)]
+pub mod keyboard;
+
+#[derive(PartialEq, Copy, Clone, Debug)]
 pub enum InputDevice {
     Wacom,
     Multitouch,
     GPIO,
+    Keyboard,
     Unknown,
-}
-
-pub enum InputDeviceState {
-    WacomState(std::sync::Arc<wacom::WacomState>),
-    MultitouchState(std::sync::Arc<multitouch::MultitouchState>),
-    GPIOState(std::sync::Arc<gpio::GPIOState>),
 }
 
 use std;
 use std::sync::Arc;
+
+pub enum InputDeviceState {
+    WacomState(Arc<wacom::WacomState>),
+    MultitouchState(Arc<multitouch::MultitouchState>),
+    GPIOState(Arc<gpio::GPIOState>),
+    KeyboardState(Arc<keyboard::KeyboardState>),
+}
+
 impl Clone for InputDeviceState {
     fn clone(&self) -> InputDeviceState {
         match self {
@@ -38,6 +43,9 @@ impl Clone for InputDeviceState {
             }
             InputDeviceState::GPIOState(ref state) => {
                 InputDeviceState::GPIOState(Arc::clone(state))
+            }
+            InputDeviceState::KeyboardState(ref state) => {
+                InputDeviceState::KeyboardState(Arc::clone(state))
             }
         }
     }
@@ -53,7 +61,10 @@ impl InputDeviceState {
             InputDevice::Multitouch => {
                 InputDeviceState::MultitouchState(Arc::new(multitouch::MultitouchState::default()))
             }
-            _ => unreachable!(),
+            InputDevice::Keyboard => {
+                InputDeviceState::KeyboardState(Arc::new(keyboard::KeyboardState::default()))
+            },
+            InputDevice::Unknown => unreachable!(),
         }
     }
 }
@@ -63,6 +74,7 @@ pub enum InputEvent {
     WacomEvent { event: wacom::WacomEvent },
     MultitouchEvent { event: multitouch::MultitouchEvent },
     GPIO { event: gpio::GPIOEvent },
+    Keyboard { event: keyboard::KeyboardEvent },
     Unknown {},
 }
 
